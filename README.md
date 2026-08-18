@@ -24,7 +24,7 @@
    | `TG_BOT_TOKEN` | 否 | Telegram Bot Token（[@BotFather](https://t.me/BotFather) 获取） |
    | `TG_CHAT_ID` | 否 | 接收通知的 Chat ID（[@userinfobot](https://t.me/userinfobot) 获取） |
    | `KITEYUAN_ACCOUNTS` | 否 | 多账号，JSON 数组，优先级高于上面两个 |
-   | `TG_API_HOST` | 否 | 自建 Telegram API 反代地址 |
+   | `TG_API_HOST` | 否 | 自建 Telegram API 反代地址；留空/不配置时自动使用 `https://api.telegram.org` |
 
    多账号格式：
 

@@ -37,7 +37,16 @@ jobs:
           cache: pip
 
       - name: 安装依赖
-        run: pip install -r requirements.txt
+        # curl_cffi 的预编译 wheel 从官方 PyPI 获取，避免部分镜像未同步该包。
+        run: pip install --upgrade pip && pip install --index-url https://pypi.org/simple -r requirements.txt
+
+      - name: 验证 Cloudflare 兼容 HTTP 后端
+        run: |
+          python - <<'PY'
+          from curl_cffi import requests
+          s = requests.Session(impersonate="chrome")
+          print("curl_cffi / Chrome TLS 指纹就绪")
+          PY
 
       - name: 执行签到
         env:

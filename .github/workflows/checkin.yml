@@ -1,0 +1,90 @@
+name: 纸鸢网盘签到
+
+on:
+  schedule:
+    # UTC 00:05 = 北京时间 08:05，每日执行
+    - cron: "5 0 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "kiteyuan_checkin.py"
+      - ".github/workflows/checkin.yml"
+
+# keepalive 需要写 actions 权限来重新启用被自动禁用的 workflow
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: kiteyuan-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    # 启动随机延时最多 30 分钟，需留足超时余量
+    timeout-minutes: 50
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 执行签到
+        env:
+          KITEYUAN_EMAIL: ${{ secrets.KITEYUAN_EMAIL }}
+          KITEYUAN_PASSWORD: ${{ secrets.KITEYUAN_PASSWORD }}
+          KITEYUAN_ACCOUNTS: ${{ secrets.KITEYUAN_ACCOUNTS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_API_HOST: ${{ secrets.TG_API_HOST }}
+          # 定时触发才做随机延时（默认 0~30 分钟）；手动触发立即执行
+          START_DELAY_MAX: ${{ github.event_name == 'schedule' && '1800' || '0' }}
+        run: python kiteyuan_checkin.py
+
+      # ---- 防 60 天无活动被自动禁用 ----
+      # GitHub 会在仓库 60 天无提交活动后停用 schedule 触发。
+      # 两道保险：① 直接调用 API 重新启用当前 workflow；② 每 20 天推一次空提交刷新活动时间。
+      - name: Keepalive - 重新启用 workflow
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PUT \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/checkin.yml/enable" \
+            && echo "workflow enable 调用成功" \
+            || echo "workflow enable 调用失败（通常表示本就处于启用状态），忽略"
+
+      - name: Keepalive - 定期空提交
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          days=$(( (now - last) / 86400 ))
+          echo "距上次提交 ${days} 天"
+
+          if [ "$days" -ge 20 ]; then
+            mkdir -p .github
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/last-keepalive
+            git add .github/last-keepalive
+            git commit -m "chore: keepalive $(date -u +%F)" || exit 0
+            git push
+            echo "已推送 keepalive 提交"
+          else
+            echo "未满 20 天，跳过"
+          fi

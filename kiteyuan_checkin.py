@@ -40,6 +40,13 @@ from urllib.parse import quote, urlsplit
 
 import requests
 
+# curl_cffi 模拟浏览器 TLS/HTTP2 指纹，主要用于规避 GitHub Actions 机房 IP 的 CF 403。
+# 保留 requests 回退，以便依赖安装异常时脚本仍能给出可读错误或在无 CF 拦截环境运行。
+try:
+    from curl_cffi import requests as curl_requests
+except ImportError:
+    curl_requests = None
+
 SITE = "https://mybt.kiteyuan.info"
 API = SITE + "/api"
 CASDOOR = "https://auth.kiteyuan.info"
@@ -143,9 +150,21 @@ class KiteYuanClient:
         self.email = email
         self.password = password
         self.label = label or email
-        self.session = requests.Session()
-        # 关键: 站点对浏览器 UA 的请求有额外风控, 使用默认/普通 UA 更稳定
-        self.session.headers.update({"Accept": "*/*"})
+        # curl_cffi 会模拟 Chrome 的 TLS / HTTP2 指纹。
+        # GitHub Actions 的机房 IP 用普通 python-requests 容易被 Cloudflare 返回 403。
+        if curl_requests is not None:
+            self.session = curl_requests.Session(impersonate="chrome")
+            self.http_backend = "curl_cffi/Chrome"
+        else:
+            self.session = requests.Session()
+            self.http_backend = "requests（未安装 curl_cffi，CF 403 风险较高）"
+        self.session.headers.update({
+            "User-Agent": UA,
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": SITE,
+            "Referer": SITE + "/",
+        })
         self.token = ""
         self.secret = ""
         self.user = {}
@@ -232,7 +251,8 @@ class KiteYuanClient:
                     data=body_str or None,
                     timeout=TIMEOUT,
                 )
-            except requests.RequestException as exc:
+            except Exception as exc:
+                # curl_cffi 与 requests 的异常类不同；这里统一纳入重试。
                 last_err = exc
                 # 指数退避 + 随机抖动
                 time.sleep(2 ** attempt * 2 + random.uniform(0, 2))
@@ -296,7 +316,8 @@ def notify_telegram(text: str):
     if not token or not chat_id:
         print("[TG] 未配置 TG_BOT_TOKEN / TG_CHAT_ID, 跳过推送")
         return
-    api = os.environ.get("TG_API_HOST", "https://api.telegram.org").rstrip("/")
+    # GitHub Secret 未配置时会作为空字符串注入，不能只依赖 get() 的默认值。
+    api = (os.environ.get("TG_API_HOST", "").strip() or "https://api.telegram.org").rstrip("/")
     for attempt in range(3):
         try:
             r = requests.post(
@@ -380,6 +401,7 @@ def main():
         lines.append(header)
         print(f"\n=== 账号 {idx}: {label} ===")
         client = KiteYuanClient(email, password, label)
+        print(f"HTTP 后端: {client.http_backend}")
         try:
             client.login()
             print(f"登录成功, 当前积分 {client.user.get('points')}")

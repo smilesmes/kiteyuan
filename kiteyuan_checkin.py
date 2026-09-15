@@ -8,8 +8,9 @@
   2. Casdoor 密码登录 (/api/login?service=<授权query>)
   3. 跟随授权回调, 从最终 URL 的 ?token= 取出站点 JWT
   4. GET /api/auth/me 获取 sign_secret (HMAC 签名密钥)
-  5. 依次 POST 三个积分任务 (新用户礼包 / 每日签到 / 使用纸鸢磁力)
-  6. 汇总结果推送 Telegram
+  5. GET /api/points/tasks/status 查询任务状态, 跳过已完成的
+  6. 依次 POST 三个积分任务 (新用户礼包 / 每日签到 / 使用纸鸢磁力)
+  7. 汇总结果推送 Telegram
 
 签名算法 (逆向自前端 index-*.js):
   msg  = METHOD + "\n" + "/api" + path + "\n" + canonical_query + "\n" +
@@ -36,7 +37,7 @@ import random
 import re
 import sys
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import requests
 
@@ -63,12 +64,16 @@ TASK_DELAY_RANGE = (3, 12)      # 相邻任务之间
 ACCOUNT_DELAY_RANGE = (10, 40)  # 多账号之间
 STEP_DELAY_RANGE = (1.0, 3.0)   # 登录链路各步骤之间
 
-# 积分任务: (显示名, 接口路径)
+# 积分任务: (显示名, 接口路径, status 中的状态字段名)
+# 注意: 2026-09 站点改版后, 积分接口由 /auth/points/tasks/* 调整为 /points/tasks/*
 TASKS = [
-    ("新用户礼包", "/auth/points/tasks/newbie"),
-    ("每日签到", "/auth/points/tasks/signin"),
-    ("使用纸鸢磁力", "/auth/points/tasks/visit"),
+    ("新用户礼包", "/points/tasks/newbie", "newbie_claimed"),
+    ("每日签到", "/points/tasks/signin", "signin_today"),
+    ("使用纸鸢磁力", "/points/tasks/visit", "visit_today"),
 ]
+
+# Casdoor 应用名会随站点改版变动, 优先动态获取, 取不到时回退到已知值。
+CASDOOR_APP_FALLBACK = ("admin", "kite-drive")
 
 
 # ---------------------------------------------------------------- 延时
@@ -171,6 +176,40 @@ class KiteYuanClient:
 
     # -- 登录 --------------------------------------------------------
 
+    def resolve_application(self, service_qs):
+        """从 Casdoor 的 get-app-login 接口解析当前应用名(owner, application)。
+
+        站点改版可能更换 Casdoor 应用(例如 KiteYuan KiteMagnet -> kite-drive),
+        动态解析可避免硬编码失效; 失败时回退到 CASDOOR_APP_FALLBACK。
+        """
+        try:
+            params = dict(parse_qsl(service_qs))
+            query = urlencode({
+                "clientId": params.get("client_id", ""),
+                "responseType": params.get("response_type", "code"),
+                "redirectUri": params.get("redirect_uri", ""),
+                "type": "code",
+                "scope": params.get("scope", ""),
+                "state": params.get("state", ""),
+                "nonce": "",
+                "code_challenge_method": "",
+                "code_challenge": "",
+            })
+            r = self.session.get(
+                CASDOOR + "/api/get-app-login?" + query, timeout=TIMEOUT
+            )
+            data = (r.json() or {}).get("data") or {}
+            owner = (data.get("owner") or "").strip()
+            name = (data.get("name") or "").strip()
+            if owner and name:
+                print(f"Casdoor 应用: {owner}/{name}")
+                return owner, name
+        except Exception as exc:
+            print(f"解析 Casdoor 应用失败, 使用回退值: {exc}")
+        owner, name = CASDOOR_APP_FALLBACK
+        print(f"Casdoor 应用回退值: {owner}/{name}")
+        return owner, name
+
     def login(self):
         # 1. 取授权地址(内含服务端签发的 state)
         r = self.session.get(
@@ -183,10 +222,13 @@ class KiteYuanClient:
 
         rand_sleep(STEP_DELAY_RANGE)
 
-        # 2. Casdoor 密码登录, service 必须是完整的授权 query
+        # 2. 解析授权参数, 动态获取 Casdoor 应用名(应用名/owner 随站点改版会变)
+        owner, appname = self.resolve_application(service_qs)
+
+        # 3. Casdoor 密码登录, service 必须是完整的授权 query
         payload = {
-            "owner": "admin",
-            "application": "KiteYuan KiteMagnet",
+            "owner": owner,
+            "application": appname,
             "username": self.email,
             "password": self.password,
             "autoSignin": True,
@@ -205,7 +247,7 @@ class KiteYuanClient:
 
         rand_sleep(STEP_DELAY_RANGE)
 
-        # 3. 跟随授权回调, 从最终 URL 取出站点 token
+        # 4. 跟随授权回调, 从最终 URL 取出站点 token
         r = self.session.get(authorize_url, allow_redirects=True, timeout=TIMEOUT)
         m = re.search(r"[?&]token=([^&#]+)", r.url)
         if not m:
@@ -276,12 +318,36 @@ class KiteYuanClient:
 
     # -- 任务 --------------------------------------------------------
 
+    def task_status(self):
+        """查询任务状态(需签名)。返回 dict, 失败时返回空 dict。"""
+        try:
+            r = self.request("GET", "/points/tasks/status")
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict):
+                    return data
+        except Exception as exc:
+            print(f"任务状态查询失败(忽略): {exc}")
+        return {}
+
     def run_tasks(self):
         results = []
+        status = self.task_status()
+        if status:
+            print(f"任务状态: {status}")
+
         # 任务顺序随机化, 避免每天固定的请求序列特征
         tasks = TASKS[:]
         random.shuffle(tasks)
-        for i, (name, path) in enumerate(tasks):
+        pending = []
+        for name, path, flag in tasks:
+            if status.get(flag) is True:
+                # 状态接口显示已领取, 直接跳过, 省一次请求
+                results.append((name, "skip", "今日已完成(状态预检)"))
+            else:
+                pending.append((name, path))
+
+        for i, (name, path) in enumerate(pending):
             try:
                 r = self.request("POST", path, {})
                 try:
@@ -299,10 +365,10 @@ class KiteYuanClient:
                     results.append((name, state, msg))
             except Exception as exc:
                 results.append((name, "fail", str(exc)[:120]))
-            if i < len(tasks) - 1:
+            if i < len(pending) - 1:
                 rand_sleep(TASK_DELAY_RANGE, "任务间隔")
         # 结果按 TASKS 原顺序输出, 保持通知可读
-        order = {n: idx for idx, (n, _) in enumerate(TASKS)}
+        order = {n: idx for idx, (n, _, _) in enumerate(TASKS)}
         results.sort(key=lambda x: order.get(x[0], 99))
         return results
 

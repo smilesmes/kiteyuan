@@ -6,9 +6,11 @@
 
 | 任务 | 接口 | 说明 |
 | --- | --- | --- |
-| 新用户礼包 | `POST /api/auth/points/tasks/newbie` | 仅一次，+1 积分 |
-| 每日签到 | `POST /api/auth/points/tasks/signin` | 每日 +4 积分 |
-| 使用纸鸢磁力 | `POST /api/auth/points/tasks/visit` | 每日 +1 积分 |
+| 新用户礼包 | `POST /api/points/tasks/newbie` | 仅一次，+1 积分 |
+| 每日签到 | `POST /api/points/tasks/signin` | 每日 +4 积分 |
+| 使用纸鸢磁力 | `POST /api/points/tasks/visit` | 每日 +1 积分 |
+
+执行前会先调 `GET /api/points/tasks/status` 查询状态，已完成的直接跳过。
 
 「邀请好友」需要填别人的邀请码，属于一次性手动操作，脚本不做处理。
 
@@ -96,7 +98,9 @@ X-Timestamp = unix 秒
 
 `sign_secret` 由 `GET /api/auth/me` 返回（该接口不需要签名）。`canonical_query` 为 query 参数按 key 排序后以 `&` 拼接，不重新编码。
 
-登录链路：`GET /api/auth/casdoor/login`（拿带 state 的授权地址）→ `POST https://auth.kiteyuan.info/api/login?service=<授权query>`（密码登录）→ 跟随授权回调，从最终 URL 的 `?token=` 取站点 JWT。
+登录链路：`GET /api/auth/casdoor/login`（拿带 state 的授权地址）→ `GET https://auth.kiteyuan.info/api/get-app-login`（动态解析当前 Casdoor 应用名）→ `POST https://auth.kiteyuan.info/api/login?service=<授权query>`（密码登录）→ 跟随授权回调，从最终 URL 的 `?token=` 取站点 JWT。
+
+Casdoor 应用名会随站点改版变动（如从 `KiteYuan KiteMagnet` 改为 `kite-drive`），脚本通过 `get-app-login` 动态获取，解析失败时回退到内置默认值。
 
 ## 注意
 
